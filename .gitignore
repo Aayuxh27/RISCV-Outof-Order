@@ -1,0 +1,3 @@
+sim/cpu_sim
+waveforms/*.vcd
+.DS_Store
