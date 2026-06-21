@@ -26,8 +26,8 @@ module rat
     output reg [5:0] prs2_1,
 
     // physical destination registers
-    output reg [5:0] prd_0,
-    output reg [5:0] prd_1
+    output [5:0] prd_0,
+    output [5:0] prd_1
 );
 
 //////////////////////////////////////////////////
@@ -46,6 +46,19 @@ wire alloc1 = valid1 && (rd_1 != 0);
 wire [1:0] alloc_count = alloc0 + alloc1;
 
 //////////////////////////////////////////////////
+// DESTINATION TAGS (COMBINATIONAL)
+//////////////////////////////////////////////////
+// These must live in the same cycle as the instruction they tag.
+// They were previously registered, which attached each dispatched
+// micro-op's destination tag to the PREVIOUS cycle's instruction
+// instead of its own (decode/prs* are combinational off the current
+// instruction, so prd* has to be too, or the two desync by one slot).
+// free_ptr==0 never happens post-reset (it starts at ARCH_REGS and only
+// grows), so prd_0/prd_1==0 unambiguously means "no allocation this slot".
+assign prd_0 = alloc0 ? free_ptr : 6'd0;
+assign prd_1 = alloc1 ? (free_ptr + alloc0) : 6'd0;
+
+//////////////////////////////////////////////////
 // RESET + RENAME
 //////////////////////////////////////////////////
 always @(posedge clk or posedge reset) begin
@@ -55,28 +68,22 @@ always @(posedge clk or posedge reset) begin
             map_table[i] <= i;
         end
         free_ptr <= ARCH_REGS;
-        prd_0 <= 0;
-        prd_1 <= 0;
-    end 
+    end
     else begin
         // 1. Advance the pointer by the total number of registers allocated this cycle
         free_ptr <= free_ptr + alloc_count;
 
         // 2. Rename Instruction 0
         if(alloc0) begin
-            prd_0 <= free_ptr;
             map_table[rd_0] <= free_ptr;
-        end else begin
-            prd_0 <= 0;
         end
 
-        // 3. Rename Instruction 1 
-        // We offset by 'alloc0' so it takes the NEXT available pointer if inst0 also allocated
+        // 3. Rename Instruction 1
+        // We offset by 'alloc0' so it takes the NEXT available pointer if inst0 also allocated.
+        // If rd_0==rd_1 (WAW in the same group) this statement runs second and wins, which is
+        // correct: the later instruction in program order owns the architectural mapping.
         if(alloc1) begin
-            prd_1 <= free_ptr + alloc0;
             map_table[rd_1] <= free_ptr + alloc0;
-        end else begin
-            prd_1 <= 0;
         end
     end
 end

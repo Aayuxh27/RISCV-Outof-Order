@@ -15,7 +15,15 @@ module decode_unit
 
     output reg [4:0] rs1_1,
     output reg [4:0] rs2_1,
-    output reg [4:0] rd_1
+    output reg [4:0] rd_1,
+
+    // I-type immediate (sign-extended) and a flag telling downstream
+    // stages to use it instead of the rs2 operand value
+    output reg use_imm0,
+    output reg [31:0] imm0,
+
+    output reg use_imm1,
+    output reg [31:0] imm1
 );
 
 //////////////////////////////////////////////////
@@ -30,6 +38,12 @@ wire [2:0] f3_1 = inst1[14:12];
 
 wire [6:0] f7_0 = inst0[31:25];
 wire [6:0] f7_1 = inst1[31:25];
+
+// I-type immediate lives in bits [31:20] and must be sign-extended,
+// not read as a second register index (that was the original bug:
+// rs2[24:20] and imm[11:5] physically overlap in the encoding).
+wire [31:0] imm_i0 = {{20{inst0[31]}}, inst0[31:20]};
+wire [31:0] imm_i1 = {{20{inst1[31]}}, inst1[31:20]};
 
 //////////////////////////////////////////////////
 // DECODE LOGIC
@@ -47,7 +61,9 @@ rs1_0 = inst0[19:15];
 rs2_0 = inst0[24:20];
 rd_0  = inst0[11:7];
 
-opcode0 = 0;
+opcode0  = 0;
+use_imm0 = 0;
+imm0     = 32'd0;
 
 if(op0 == 7'b0110011) begin
 
@@ -69,6 +85,13 @@ if(op0 == 7'b0110011) begin
 
 end
 else if(op0 == 7'b0010011) begin
+
+    // I-type: rs2_0 does not name a real register here (those bits
+    // are imm[4:0]), so force it to x0 -- it renames to p0, which is
+    // always ready/zero -- and route the real operand through imm0.
+    rs2_0    = 5'd0;
+    use_imm0 = 1;
+    imm0     = imm_i0;
 
     case(f3_0)
 
@@ -98,7 +121,9 @@ rs1_1 = inst1[19:15];
 rs2_1 = inst1[24:20];
 rd_1  = inst1[11:7];
 
-opcode1 = 0;
+opcode1  = 0;
+use_imm1 = 0;
+imm1     = 32'd0;
 
 if(op1 == 7'b0110011) begin
 
@@ -120,6 +145,10 @@ if(op1 == 7'b0110011) begin
 
 end
 else if(op1 == 7'b0010011) begin
+
+    rs2_1    = 5'd0;
+    use_imm1 = 1;
+    imm1     = imm_i1;
 
     case(f3_1)
 
