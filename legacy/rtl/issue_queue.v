@@ -6,6 +6,13 @@ module issue_queue
     input clk,
     input reset,
 
+    // Wrong-path entries get flushed wholesale on a misprediction --
+    // selectively keeping older-than-branch entries would need
+    // per-entry age tracking this design doesn't have, and the queue
+    // is shallow enough (8 entries) that draining it from empty after
+    // a flush is cheap relative to the branch resolution latency anyway.
+    input misprediction_valid,
+
     ////////////////////////////////////////////////
     // DISPATCH INPUT (BOTH SLOTS, SAME CYCLE)
     ////////////////////////////////////////////////
@@ -19,6 +26,11 @@ module issue_queue
     input [31:0] imm0,
     input ready1_0,
     input ready2_0,
+    input is_branch0,
+    input [2:0] branch_cond0,
+    input [31:0] branch_target0,
+    input [31:0] branch_pc0,
+    input predicted_taken0,
 
     input valid1,
     input [3:0] opcode1,
@@ -29,6 +41,11 @@ module issue_queue
     input [31:0] imm1,
     input ready1_1,
     input ready2_1,
+    input is_branch1,
+    input [2:0] branch_cond1,
+    input [31:0] branch_target1,
+    input [31:0] branch_pc1,
+    input predicted_taken1,
 
     ////////////////////////////////////////////////
     // BROADCAST FROM EXECUTION (2 CDB PORTS)
@@ -58,12 +75,17 @@ module issue_queue
     output reg [ISSUEQ_SIZE-1:0] ready1,
     output reg [ISSUEQ_SIZE-1:0] ready2,
     output reg [ISSUEQ_SIZE-1:0] use_imm,
+    output reg [ISSUEQ_SIZE-1:0] is_branch,
+    output reg [ISSUEQ_SIZE-1:0] predicted_taken,
 
     output reg [3:0] opcode [ISSUEQ_SIZE-1:0],
     output reg [5:0] prs1   [ISSUEQ_SIZE-1:0],
     output reg [5:0] prs2   [ISSUEQ_SIZE-1:0],
     output reg [5:0] pd     [ISSUEQ_SIZE-1:0],
-    output reg [31:0] imm   [ISSUEQ_SIZE-1:0]
+    output reg [31:0] imm   [ISSUEQ_SIZE-1:0],
+    output reg [2:0] branch_cond   [ISSUEQ_SIZE-1:0],
+    output reg [31:0] branch_target [ISSUEQ_SIZE-1:0],
+    output reg [31:0] branch_pc     [ISSUEQ_SIZE-1:0]
 );
 
 integer i;
@@ -77,7 +99,7 @@ integer free_index1;
 always @(posedge clk or posedge reset)
 begin
 
-    if(reset)
+    if(reset || misprediction_valid)
     begin
 
         for(i=0;i<ISSUEQ_SIZE;i=i+1)
@@ -86,12 +108,17 @@ begin
             ready1[i]  <= 0;
             ready2[i]  <= 0;
             use_imm[i] <= 0;
+            is_branch[i] <= 0;
+            predicted_taken[i] <= 0;
 
             opcode[i] <= 0;
             prs1[i]   <= 0;
             prs2[i]   <= 0;
             pd[i]     <= 0;
             imm[i]    <= 0;
+            branch_cond[i]   <= 0;
+            branch_target[i] <= 0;
+            branch_pc[i]     <= 0;
         end
 
     end
@@ -162,6 +189,11 @@ begin
             imm[free_index0]     <= imm0;
             ready1[free_index0]  <= ready1_0;
             ready2[free_index0]  <= ready2_0;
+            is_branch[free_index0]       <= is_branch0;
+            predicted_taken[free_index0] <= predicted_taken0;
+            branch_cond[free_index0]     <= branch_cond0;
+            branch_target[free_index0]   <= branch_target0;
+            branch_pc[free_index0]       <= branch_pc0;
         end
 
         free_index1 = -1;
@@ -182,6 +214,11 @@ begin
             imm[free_index1]     <= imm1;
             ready1[free_index1]  <= ready1_1;
             ready2[free_index1]  <= ready2_1;
+            is_branch[free_index1]       <= is_branch1;
+            predicted_taken[free_index1] <= predicted_taken1;
+            branch_cond[free_index1]     <= branch_cond1;
+            branch_target[free_index1]   <= branch_target1;
+            branch_pc[free_index1]       <= branch_pc1;
         end
 
     end

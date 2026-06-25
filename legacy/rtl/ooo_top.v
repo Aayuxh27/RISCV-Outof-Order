@@ -4,6 +4,20 @@ module ooo_top(
 );
 
 //////////////////////////////////////////////////
+// RECOVERY WIRES -- declared early; fetch_unit, dispatch_unit, rat,
+// issue_queue and reorder_buffer all consume these
+//////////////////////////////////////////////////
+
+wire misprediction_valid;
+wire [31:0] misprediction_pc;
+
+wire final_redirect_valid;
+wire [31:0] final_redirect_pc;
+
+wire rat_stall;
+wire ckpt_conflict;
+
+//////////////////////////////////////////////////
 // FETCH
 //////////////////////////////////////////////////
 
@@ -14,6 +28,15 @@ wire [31:0] inst1;
 fetch_unit fetch_inst(
     .clk(clk),
     .reset(reset),
+
+    .misprediction_valid(misprediction_valid),
+    .misprediction_pc(misprediction_pc),
+
+    .redirect_valid(final_redirect_valid),
+    .redirect_pc(final_redirect_pc),
+
+    .stall(rat_stall),
+
     .pc(pc),
     .inst0(inst0),
     .inst1(inst1)
@@ -24,7 +47,7 @@ fetch_unit fetch_inst(
 //////////////////////////////////////////////////
 
 wire valid0;
-wire valid1;
+wire valid1_raw;
 
 wire [3:0] opcode0;
 wire [3:0] opcode1;
@@ -43,12 +66,23 @@ wire [31:0] imm0;
 wire use_imm1;
 wire [31:0] imm1;
 
+wire is_branch0;
+wire [2:0] branch_cond0;
+wire [31:0] branch_target0;
+wire [31:0] branch_pc0;
+
+wire is_branch1;
+wire [2:0] branch_cond1;
+wire [31:0] branch_target1;
+wire [31:0] branch_pc1;
+
 decode_unit decode_inst(
+    .pc(pc),
     .inst0(inst0),
     .inst1(inst1),
 
     .valid0(valid0),
-    .valid1(valid1),
+    .valid1(valid1_raw),
 
     .opcode0(opcode0),
     .opcode1(opcode1),
@@ -65,8 +99,80 @@ decode_unit decode_inst(
     .imm0(imm0),
 
     .use_imm1(use_imm1),
-    .imm1(imm1)
+    .imm1(imm1),
+
+    .is_branch0(is_branch0),
+    .branch_cond0(branch_cond0),
+    .branch_target0(branch_target0),
+    .branch_pc0(branch_pc0),
+
+    .is_branch1(is_branch1),
+    .branch_cond1(branch_cond1),
+    .branch_target1(branch_target1),
+    .branch_pc1(branch_pc1)
 );
+
+//////////////////////////////////////////////////
+// BRANCH PREDICTOR
+//////////////////////////////////////////////////
+
+wire predicted_taken0;
+wire predicted_taken1;
+
+wire bp_redirect_valid;
+wire [31:0] bp_redirect_pc;
+wire bp_squash_slot1;
+
+wire branch_resolved_valid;
+wire branch_mispredicted;
+wire [31:0] branch_correct_target;
+wire [31:0] branch_update_pc;
+wire branch_update_taken;
+
+branch_predict_unit bp_inst(
+    .clk(clk),
+    .reset(reset),
+
+    .pc(pc),
+
+    .is_branch0(is_branch0),
+    .branch_target0(branch_target0),
+
+    .is_branch1(is_branch1),
+    .branch_target1(branch_target1),
+
+    .predicted_taken0(predicted_taken0),
+    .predicted_taken1(predicted_taken1),
+
+    .redirect_valid(bp_redirect_valid),
+    .redirect_pc(bp_redirect_pc),
+    .squash_slot1(bp_squash_slot1),
+
+    .update_valid(branch_resolved_valid),
+    .update_pc(branch_update_pc),
+    .update_taken(branch_update_taken)
+);
+
+//////////////////////////////////////////////////
+// SLOT 1 GATING + RECOVERY SIGNAL COMBINING
+//////////////////////////////////////////////////
+// valid1_bp: gated once by the predictor (a taken slot-0 branch makes
+// slot 1 wrong-path) -- this is what rat.v sees, since it computes its
+// own ckpt_conflict from it. valid1: gated a second time by that very
+// ckpt_conflict output -- this is what everything past the RAT
+// (dispatch_unit and onward) sees, so a slot 1 that lost the single
+// checkpoint to slot 0 never gets renamed OR dispatched.
+
+wire valid1_bp = valid1_raw && !bp_squash_slot1;
+wire valid1    = valid1_bp && !ckpt_conflict;
+
+assign misprediction_valid = branch_resolved_valid && branch_mispredicted;
+wire   branch_correct_valid = branch_resolved_valid && !branch_mispredicted;
+
+assign misprediction_pc = branch_correct_target;
+
+assign final_redirect_valid = bp_redirect_valid || ckpt_conflict;
+assign final_redirect_pc    = ckpt_conflict ? (pc + 32'd4) : bp_redirect_pc;
 
 //////////////////////////////////////////////////
 // RAT
@@ -85,7 +191,7 @@ rat rat_inst(
     .reset(reset),
 
     .valid0(valid0),
-    .valid1(valid1),
+    .valid1(valid1_bp),
 
     .rs1_0(rs1_0),
     .rs2_0(rs2_0),
@@ -95,13 +201,22 @@ rat rat_inst(
     .rs2_1(rs2_1),
     .rd_1(rd_1),
 
+    .is_branch0(is_branch0),
+    .is_branch1(is_branch1),
+
+    .misprediction_valid(misprediction_valid),
+    .branch_correct_valid(branch_correct_valid),
+
     .prs1_0(prs1_0),
     .prs2_0(prs2_0),
     .prs1_1(prs1_1),
     .prs2_1(prs2_1),
 
     .prd_0(prd_0),
-    .prd_1(prd_1)
+    .prd_1(prd_1),
+
+    .stall(rat_stall),
+    .ckpt_conflict(ckpt_conflict)
 );
 
 //////////////////////////////////////////////////
@@ -142,6 +257,21 @@ wire issue1_use_imm;
 
 wire [31:0] issue0_imm;
 wire [31:0] issue1_imm;
+
+wire issue0_is_branch;
+wire issue1_is_branch;
+
+wire issue0_predicted_taken;
+wire issue1_predicted_taken;
+
+wire [2:0] issue0_branch_cond;
+wire [2:0] issue1_branch_cond;
+
+wire [31:0] issue0_branch_target;
+wire [31:0] issue1_branch_target;
+
+wire [31:0] issue0_branch_pc;
+wire [31:0] issue1_branch_pc;
 
 wire [2:0] issue0_index;
 wire [2:0] issue1_index;
@@ -209,6 +339,11 @@ wire iq_use_imm0;
 wire [31:0] iq_imm0;
 wire iq_ready1_0;
 wire iq_ready2_0;
+wire iq_is_branch0;
+wire [2:0] iq_branch_cond0;
+wire [31:0] iq_branch_target0;
+wire [31:0] iq_branch_pc0;
+wire iq_predicted_taken0;
 
 wire iq_valid1;
 wire [3:0] iq_opcode1;
@@ -219,11 +354,19 @@ wire iq_use_imm1;
 wire [31:0] iq_imm1;
 wire iq_ready1_1;
 wire iq_ready2_1;
+wire iq_is_branch1;
+wire [2:0] iq_branch_cond1;
+wire [31:0] iq_branch_target1;
+wire [31:0] iq_branch_pc1;
+wire iq_predicted_taken1;
 
 wire rob_dispatch0;
 wire rob_dispatch1;
 
 dispatch_unit dispatch_inst(
+    .stall(rat_stall),
+    .misprediction_valid(misprediction_valid),
+
     .valid0(valid0),
     .opcode0(opcode0),
     .prs1_0(prs1_0),
@@ -233,6 +376,11 @@ dispatch_unit dispatch_inst(
     .imm0(imm0),
     .ready1_0(ready1_0),
     .ready2_0(ready2_0),
+    .is_branch0(is_branch0),
+    .branch_cond0(branch_cond0),
+    .branch_target0(branch_target0),
+    .branch_pc0(branch_pc0),
+    .predicted_taken0(predicted_taken0),
 
     .valid1(valid1),
     .opcode1(opcode1),
@@ -243,6 +391,11 @@ dispatch_unit dispatch_inst(
     .imm1(imm1),
     .ready1_1(ready1_1),
     .ready2_1(ready2_1),
+    .is_branch1(is_branch1),
+    .branch_cond1(branch_cond1),
+    .branch_target1(branch_target1),
+    .branch_pc1(branch_pc1),
+    .predicted_taken1(predicted_taken1),
 
     .iq_valid0(iq_valid0),
     .iq_opcode0(iq_opcode0),
@@ -253,6 +406,11 @@ dispatch_unit dispatch_inst(
     .iq_imm0(iq_imm0),
     .iq_ready1_0(iq_ready1_0),
     .iq_ready2_0(iq_ready2_0),
+    .iq_is_branch0(iq_is_branch0),
+    .iq_branch_cond0(iq_branch_cond0),
+    .iq_branch_target0(iq_branch_target0),
+    .iq_branch_pc0(iq_branch_pc0),
+    .iq_predicted_taken0(iq_predicted_taken0),
 
     .iq_valid1(iq_valid1),
     .iq_opcode1(iq_opcode1),
@@ -263,6 +421,11 @@ dispatch_unit dispatch_inst(
     .iq_imm1(iq_imm1),
     .iq_ready1_1(iq_ready1_1),
     .iq_ready2_1(iq_ready2_1),
+    .iq_is_branch1(iq_is_branch1),
+    .iq_branch_cond1(iq_branch_cond1),
+    .iq_branch_target1(iq_branch_target1),
+    .iq_branch_pc1(iq_branch_pc1),
+    .iq_predicted_taken1(iq_predicted_taken1),
 
     .rob_dispatch0(rob_dispatch0),
     .rob_dispatch1(rob_dispatch1)
@@ -276,12 +439,17 @@ wire [7:0] iqs_valid;
 wire [7:0] iqs_ready1;
 wire [7:0] iqs_ready2;
 wire [7:0] iqs_use_imm;
+wire [7:0] iqs_is_branch;
+wire [7:0] iqs_predicted_taken;
 
 wire [3:0] iqs_opcode [7:0];
 wire [5:0] iqs_prs1   [7:0];
 wire [5:0] iqs_prs2   [7:0];
 wire [5:0] iqs_pd     [7:0];
 wire [31:0] iqs_imm   [7:0];
+wire [2:0] iqs_branch_cond   [7:0];
+wire [31:0] iqs_branch_target [7:0];
+wire [31:0] iqs_branch_pc     [7:0];
 
 //////////////////////////////////////////////////
 // ISSUE QUEUE
@@ -290,6 +458,8 @@ wire [31:0] iqs_imm   [7:0];
 issue_queue iq_inst(
     .clk(clk),
     .reset(reset),
+
+    .misprediction_valid(misprediction_valid),
 
     .valid0(iq_valid0),
     .opcode0(iq_opcode0),
@@ -300,6 +470,11 @@ issue_queue iq_inst(
     .imm0(iq_imm0),
     .ready1_0(iq_ready1_0),
     .ready2_0(iq_ready2_0),
+    .is_branch0(iq_is_branch0),
+    .branch_cond0(iq_branch_cond0),
+    .branch_target0(iq_branch_target0),
+    .branch_pc0(iq_branch_pc0),
+    .predicted_taken0(iq_predicted_taken0),
 
     .valid1(iq_valid1),
     .opcode1(iq_opcode1),
@@ -310,6 +485,11 @@ issue_queue iq_inst(
     .imm1(iq_imm1),
     .ready1_1(iq_ready1_1),
     .ready2_1(iq_ready2_1),
+    .is_branch1(iq_is_branch1),
+    .branch_cond1(iq_branch_cond1),
+    .branch_target1(iq_branch_target1),
+    .branch_pc1(iq_branch_pc1),
+    .predicted_taken1(iq_predicted_taken1),
 
     .broadcast0_valid(broadcast0_valid),
     .broadcast0_tag(broadcast0_tag),
@@ -327,12 +507,17 @@ issue_queue iq_inst(
     .ready1(iqs_ready1),
     .ready2(iqs_ready2),
     .use_imm(iqs_use_imm),
+    .is_branch(iqs_is_branch),
+    .predicted_taken(iqs_predicted_taken),
 
     .opcode(iqs_opcode),
     .prs1(iqs_prs1),
     .prs2(iqs_prs2),
     .pd(iqs_pd),
-    .imm(iqs_imm)
+    .imm(iqs_imm),
+    .branch_cond(iqs_branch_cond),
+    .branch_target(iqs_branch_target),
+    .branch_pc(iqs_branch_pc)
 );
 
 //////////////////////////////////////////////////
@@ -347,12 +532,17 @@ scheduler sched_inst(
     .ready1(iqs_ready1),
     .ready2(iqs_ready2),
     .use_imm(iqs_use_imm),
+    .is_branch(iqs_is_branch),
+    .predicted_taken(iqs_predicted_taken),
 
     .opcode(iqs_opcode),
     .prs1(iqs_prs1),
     .prs2(iqs_prs2),
     .pd(iqs_pd),
     .imm(iqs_imm),
+    .branch_cond(iqs_branch_cond),
+    .branch_target(iqs_branch_target),
+    .branch_pc(iqs_branch_pc),
 
     .issue0_valid(issue0_valid),
     .issue0_opcode(issue0_opcode),
@@ -361,6 +551,11 @@ scheduler sched_inst(
     .issue0_pd(issue0_pd),
     .issue0_use_imm(issue0_use_imm),
     .issue0_imm(issue0_imm),
+    .issue0_is_branch(issue0_is_branch),
+    .issue0_predicted_taken(issue0_predicted_taken),
+    .issue0_branch_cond(issue0_branch_cond),
+    .issue0_branch_target(issue0_branch_target),
+    .issue0_branch_pc(issue0_branch_pc),
     .issue0_index(issue0_index),
 
     .issue1_valid(issue1_valid),
@@ -370,6 +565,11 @@ scheduler sched_inst(
     .issue1_pd(issue1_pd),
     .issue1_use_imm(issue1_use_imm),
     .issue1_imm(issue1_imm),
+    .issue1_is_branch(issue1_is_branch),
+    .issue1_predicted_taken(issue1_predicted_taken),
+    .issue1_branch_cond(issue1_branch_cond),
+    .issue1_branch_target(issue1_branch_target),
+    .issue1_branch_pc(issue1_branch_pc),
     .issue1_index(issue1_index)
 );
 
@@ -386,6 +586,11 @@ execution_units exec_inst(
     .issue0_pd(issue0_pd),
     .issue0_use_imm(issue0_use_imm),
     .issue0_imm(issue0_imm),
+    .issue0_is_branch(issue0_is_branch),
+    .issue0_predicted_taken(issue0_predicted_taken),
+    .issue0_branch_cond(issue0_branch_cond),
+    .issue0_branch_target(issue0_branch_target),
+    .issue0_branch_pc(issue0_branch_pc),
     .rs1_val0(issue0_rs1_val),
     .rs2_val0(issue0_rs2_val),
 
@@ -394,6 +599,11 @@ execution_units exec_inst(
     .issue1_pd(issue1_pd),
     .issue1_use_imm(issue1_use_imm),
     .issue1_imm(issue1_imm),
+    .issue1_is_branch(issue1_is_branch),
+    .issue1_predicted_taken(issue1_predicted_taken),
+    .issue1_branch_cond(issue1_branch_cond),
+    .issue1_branch_target(issue1_branch_target),
+    .issue1_branch_pc(issue1_branch_pc),
     .rs1_val1(issue1_rs1_val),
     .rs2_val1(issue1_rs2_val),
 
@@ -403,7 +613,13 @@ execution_units exec_inst(
 
     .broadcast1_valid(broadcast1_valid),
     .broadcast1_tag(broadcast1_tag),
-    .broadcast1_value(broadcast1_value)
+    .broadcast1_value(broadcast1_value),
+
+    .branch_resolved_valid(branch_resolved_valid),
+    .branch_mispredicted(branch_mispredicted),
+    .branch_correct_target(branch_correct_target),
+    .branch_update_pc(branch_update_pc),
+    .branch_update_taken(branch_update_taken)
 );
 
 //////////////////////////////////////////////////
@@ -429,6 +645,9 @@ reorder_buffer rob_inst(
     .prd_0(prd_0),
     .prd_1(prd_1),
 
+    .is_branch0(is_branch0),
+    .is_branch1(is_branch1),
+
     .rob_index0(rob_index0),
     .rob_index1(rob_index1),
 
@@ -437,6 +656,9 @@ reorder_buffer rob_inst(
 
     .broadcast1_valid(broadcast1_valid),
     .broadcast1_tag(broadcast1_tag),
+
+    .branch_resolved_valid(branch_resolved_valid),
+    .misprediction_valid(misprediction_valid),
 
     .commit0_valid(commit0_valid),
     .commit0_tag(commit0_tag),

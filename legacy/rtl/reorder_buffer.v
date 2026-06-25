@@ -16,6 +16,12 @@ module reorder_buffer
     input [5:0] prd_0,
     input [5:0] prd_1,
 
+    // Which slot, if either, is the (at most one outstanding) branch --
+    // used to remember its own ROB index without needing a per-entry
+    // is_branch tag, since there's only ever one to track.
+    input is_branch0,
+    input is_branch1,
+
     output reg [4:0] rob_index0,
     output reg [4:0] rob_index1,
 
@@ -28,6 +34,16 @@ module reorder_buffer
 
     input broadcast1_valid,
     input [5:0] broadcast1_tag,
+
+//////////////////////////////////////////////////
+// BRANCH RESOLUTION / MISPREDICTION FLUSH
+//////////////////////////////////////////////////
+// A branch has tag==0 (no destination register), so it can't be
+// marked ready by the tag-matching writeback logic above the way an
+// ALU result can -- it's signaled directly by index instead.
+
+    input branch_resolved_valid,
+    input misprediction_valid,
 
 //////////////////////////////////////////////////
 // COMMIT OUTPUT (UP TO 2 PER CYCLE)
@@ -48,6 +64,8 @@ reg valid [0:ROB_SIZE-1];
 reg ready [0:ROB_SIZE-1];
 reg [5:0] tag [0:ROB_SIZE-1];
 
+reg [4:0] outstanding_branch_index;
+
 //////////////////////////////////////////////////
 // HEAD / TAIL POINTERS
 //////////////////////////////////////////////////
@@ -56,6 +74,17 @@ reg [4:0] head;
 reg [4:0] tail;
 
 integer i;
+
+//////////////////////////////////////////////////
+// MISPREDICTION FLUSH RANGE
+//////////////////////////////////////////////////
+// Entries strictly after the branch, up to (not including) tail, are
+// wrong-path and must be invalidated -- computed as a circular-buffer
+// membership test (offset-from-start < length) so it works regardless
+// of where the 5-bit index has wrapped around.
+
+wire [4:0] flush_start = outstanding_branch_index + 5'd1;
+wire [4:0] flush_len   = tail - flush_start;
 
 //////////////////////////////////////////////////
 // MAIN LOGIC
@@ -79,6 +108,8 @@ begin
 
         rob_index0 <= 0;
         rob_index1 <= 0;
+
+        outstanding_branch_index <= 0;
 
         commit0_valid <= 0;
         commit0_tag   <= 0;
@@ -104,6 +135,9 @@ begin
             tag[tail]   <= prd_0;
 
             rob_index0 <= tail;
+
+            if(is_branch0)
+                outstanding_branch_index <= tail;
         end
 
         if(dispatch1_valid)
@@ -113,6 +147,9 @@ begin
             tag[tail + dispatch0_valid]   <= prd_1;
 
             rob_index1 <= tail + dispatch0_valid;
+
+            if(is_branch1)
+                outstanding_branch_index <= tail + dispatch0_valid;
         end
 
         tail <= tail + dispatch0_valid + dispatch1_valid;
@@ -133,6 +170,25 @@ begin
             for(i=0;i<ROB_SIZE;i=i+1)
                 if(valid[i] && tag[i] == broadcast1_tag)
                     ready[i] <= 1;
+        end
+
+        if(branch_resolved_valid)
+            ready[outstanding_branch_index] <= 1;
+
+//////////////////////////////////////////////////
+// MISPREDICTION FLUSH
+//////////////////////////////////////////////////
+// The branch's own entry is left alone -- it executed correctly as an
+// instruction, it just predicted the wrong direction, so it still
+// retires normally (ready[outstanding_branch_index] was just set above).
+
+        if(misprediction_valid)
+        begin
+            for(i=0;i<ROB_SIZE;i=i+1)
+                if((i[4:0] - flush_start) < flush_len)
+                    valid[i] <= 0;
+
+            tail <= flush_start;
         end
 
 //////////////////////////////////////////////////

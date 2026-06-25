@@ -1,6 +1,9 @@
-sim/cpu_sim
-sim/test_dispatch
-rtl/a.out
+# Build artefacts
+build/
+tests/hex/
+*.vcd
 *.out
-waveforms/*.vcd
 .DS_Store
+
+# Legacy Icarus outputs (kept for reference under legacy/)
+sim/cpu_sim
